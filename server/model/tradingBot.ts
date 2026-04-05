@@ -37,11 +37,9 @@ interface TradingDecision {
 }
 
 export type TradingSignal = "BUY" | "SELL" | "HOLD";
-export type TradingStrategy = "MOVING_AVERAGE" | "RSI" | "MACD" | "BOLLINGER" | "ANN";
+export type TradingStrategy = "MOVING_AVERAGE" | "RSI" | "MACD" | "BOLLINGER" | "ANN" | "RNN";
 
-// ─── ANN Core (pure TypeScript, no external libraries) ────────────────────────
-// Architecture: 7 inputs → 12 hidden (ReLU) → 6 hidden (ReLU) → 3 outputs (Softmax)
-// Outputs: [P(BUY), P(SELL), P(HOLD)]
+// ─── Shared Math Helpers ──────────────────────────────────────────────────────
 
 type Matrix = number[][];
 
@@ -57,8 +55,20 @@ function zeros(size: number): number[] {
   return new Array(size).fill(0);
 }
 
+function zerosMatrix(rows: number, cols: number): Matrix {
+  return Array.from({ length: rows }, () => new Array(cols).fill(0));
+}
+
 function relu(x: number): number {
   return Math.max(0, x);
+}
+
+function tanhFn(x: number): number {
+  return Math.tanh(x);
+}
+
+function tanhDeriv(tanhVal: number): number {
+  return 1 - tanhVal * tanhVal;
 }
 
 function softmax(logits: number[]): number[] {
@@ -71,7 +81,7 @@ function softmax(logits: number[]): number[] {
 /** Forward pass through one dense layer */
 function denseForward(
   input: number[],
-  weights: Matrix,   // [outSize][inSize]
+  weights: Matrix,
   biases: number[],
   activation: (x: number) => number
 ): number[] {
@@ -88,9 +98,9 @@ function normalise(val: number, min: number, max: number): number {
 }
 
 // ─── ANN class ────────────────────────────────────────────────────────────────
+// Architecture: 7 inputs → 12 hidden (ReLU) → 6 hidden (ReLU) → 3 outputs (Softmax)
 
 class ANN {
-  // Layer weights: [outNeurons][inNeurons]
   private W1: Matrix; // 12 × 7
   private b1: number[];
   private W2: Matrix; // 6 × 12
@@ -98,7 +108,6 @@ class ANN {
   private W3: Matrix; // 3 × 6
   private b3: number[];
 
-  // Adam optimiser state (for online fine-tuning)
   private lr: number;
   private beta1 = 0.9;
   private beta2 = 0.999;
@@ -115,20 +124,14 @@ class ANN {
     this.b3 = zeros(3);
   }
 
-  /** Forward pass — returns softmax probabilities [BUY, SELL, HOLD] */
   forward(input: number[]): number[] {
     const h1 = denseForward(input, this.W1, this.b1, relu);
     const h2 = denseForward(h1,    this.W2, this.b2, relu);
-    const logits = denseForward(h2, this.W3, this.b3, x => x); // linear
+    const logits = denseForward(h2, this.W3, this.b3, x => x);
     return softmax(logits);
   }
 
-  /**
-   * Single online SGD update (cross-entropy loss).
-   * label: 0=BUY, 1=SELL, 2=HOLD
-   */
   train(input: number[], label: number): void {
-    // ── forward ──
     const h1Raw = this.W1.map((row, i) =>
       row.reduce((s, w, j) => s + w * input[j], 0) + this.b1[i]
     );
@@ -144,42 +147,32 @@ class ANN {
     );
     const probs = softmax(logits);
 
-    // ── output gradient (cross-entropy + softmax combined) ──
-    const dLogits = probs.map((p, i) => p - (i === label ? 1 : 0)); // [3]
+    const dLogits = probs.map((p, i) => p - (i === label ? 1 : 0));
 
-    // ── W3 / b3 gradients ──
     const dW3: Matrix = this.W3.map((_, i) => h2.map(hj => dLogits[i] * hj));
     const db3 = dLogits;
 
-    // ── back through h2 ──
     const dH2 = h2.map((_, j) =>
       this.W3.reduce((s, row, i) => s + row[j] * dLogits[i], 0)
     );
-    const dH2Raw = dH2.map((d, j) => d * (h2Raw[j] > 0 ? 1 : 0)); // ReLU deriv
+    const dH2Raw = dH2.map((d, j) => d * (h2Raw[j] > 0 ? 1 : 0));
 
-    // ── W2 / b2 gradients ──
     const dW2: Matrix = this.W2.map((_, i) => h1.map(hj => dH2Raw[i] * hj));
     const db2 = dH2Raw;
 
-    // ── back through h1 ──
     const dH1 = h1.map((_, j) =>
       this.W2.reduce((s, row, i) => s + row[j] * dH2Raw[i], 0)
     );
     const dH1Raw = dH1.map((d, j) => d * (h1Raw[j] > 0 ? 1 : 0));
 
-    // ── W1 / b1 gradients ──
     const dW1: Matrix = this.W1.map((_, i) => input.map(x => dH1Raw[i] * x));
     const db1 = dH1Raw;
 
-    // ── Adam update (shared step counter) ──
     this.t++;
     const bc1 = 1 - Math.pow(this.beta1, this.t);
     const bc2 = 1 - Math.pow(this.beta2, this.t);
 
-    const applyAdam = (
-      W: Matrix, dW: Matrix,
-      mW: Matrix, vW: Matrix
-    ) => {
+    const applyAdam = (W: Matrix, dW: Matrix, mW: Matrix, vW: Matrix) => {
       W.forEach((row, i) => {
         row.forEach((_, j) => {
           mW[i][j] = this.beta1 * mW[i][j] + (1 - this.beta1) * dW[i][j];
@@ -189,7 +182,6 @@ class ANN {
       });
     };
 
-    // lazy-init Adam moment buffers
     if (!this._mW1) this._initMoments();
     applyAdam(this.W1, dW1, this._mW1!, this._vW1!);
     applyAdam(this.W2, dW2, this._mW2!, this._vW2!);
@@ -201,7 +193,6 @@ class ANN {
     this._applyAdamBias(this.b3, db3, this._mb3!, this._vb3!, bc1, bc2);
   }
 
-  // ── Adam moment buffers ──
   private _mW1?: Matrix; private _vW1?: Matrix;
   private _mW2?: Matrix; private _vW2?: Matrix;
   private _mW3?: Matrix; private _vW3?: Matrix;
@@ -234,6 +225,202 @@ class ANN {
   setLearningRate(lr: number) { this.lr = lr; }
 }
 
+// ─── RNN class ────────────────────────────────────────────────────────────────
+// Elman (vanilla) RNN with BPTT over a fixed-length sequence window.
+//
+// Architecture:
+//   Input  x_t : 7 features  (same feature vector as ANN, per timestep)
+//   Hidden h_t : 20 neurons  (tanh)       h_t = tanh(Wx·x_t + Wh·h_{t-1} + bh)
+//   Output y   : 3 classes   (softmax)    y   = softmax(Wy·h_T + by)
+//
+// The model processes a sliding window of SEQ_LEN=10 daily feature vectors,
+// letting it capture short-term temporal dynamics that a feed-forward ANN cannot.
+//
+// Training: truncated BPTT through the full SEQ_LEN steps, Adam optimiser.
+// Online fine-tuning is applied after every confirmed user trade (same as ANN).
+
+class RNN {
+  static readonly INPUT_SIZE  = 7;
+  static readonly HIDDEN_SIZE = 20;
+  static readonly OUTPUT_SIZE = 3;
+  static readonly SEQ_LEN     = 10;   // timesteps per forward pass
+
+  // Recurrent weights
+  private Wx: Matrix;   // HIDDEN × INPUT   — input-to-hidden
+  private Wh: Matrix;   // HIDDEN × HIDDEN  — hidden-to-hidden (recurrent)
+  private bh: number[]; // HIDDEN
+
+  // Output weights
+  private Wy: Matrix;   // OUTPUT × HIDDEN
+  private by: number[]; // OUTPUT
+
+  // Adam state
+  private lr: number;
+  private beta1 = 0.9;
+  private beta2 = 0.999;
+  private eps   = 1e-8;
+  private t     = 0;
+
+  // Adam moment buffers (lazy-init)
+  private mWx?: Matrix; private vWx?: Matrix;
+  private mWh?: Matrix; private vWh?: Matrix;
+  private mbh?: number[]; private vbh?: number[];
+  private mWy?: Matrix; private vWy?: Matrix;
+  private mby?: number[]; private vby?: number[];
+
+  constructor(learningRate: number = 0.001) {
+    this.lr = learningRate;
+    this.Wx = xavier(RNN.HIDDEN_SIZE, RNN.INPUT_SIZE);
+    this.Wh = xavier(RNN.HIDDEN_SIZE, RNN.HIDDEN_SIZE);
+    this.bh = zeros(RNN.HIDDEN_SIZE);
+    this.Wy = xavier(RNN.OUTPUT_SIZE, RNN.HIDDEN_SIZE);
+    this.by = zeros(RNN.OUTPUT_SIZE);
+  }
+
+  // ── Forward pass ────────────────────────────────────────────────────────
+
+  /**
+   * Run the sequence through the RNN.
+   * @param sequence  Array of T feature vectors, each of length INPUT_SIZE.
+   * @returns [probs, hiddenStates, rawH]
+   *   probs        — softmax output [P(BUY), P(SELL), P(HOLD)]
+   *   hiddenStates — h_t for each timestep (needed for BPTT)
+   *   rawH         — pre-tanh values (needed for BPTT gradient)
+   */
+  private forwardFull(sequence: number[][]): {
+    probs: number[];
+    hiddenStates: number[][];
+    rawH: number[][];
+  } {
+    const H = RNN.HIDDEN_SIZE;
+    const T = sequence.length;
+
+    const hiddenStates: number[][] = [zeros(H)]; // h_0 = zeros
+    const rawH: number[][] = [];
+
+    for (let t = 0; t < T; t++) {
+      const x = sequence[t];
+      const hPrev = hiddenStates[t];
+
+      // z_t = Wx·x_t + Wh·h_{t-1} + bh
+      const z = this.Wx.map((row, i) => {
+        const wx = row.reduce((s, w, j) => s + w * x[j], 0);
+        const wh = this.Wh[i].reduce((s, w, j) => s + w * hPrev[j], 0);
+        return wx + wh + this.bh[i];
+      });
+
+      rawH.push(z);
+      hiddenStates.push(z.map(tanhFn));
+    }
+
+    // Output from final hidden state
+    const hT   = hiddenStates[T];
+    const logits = this.Wy.map((row, i) =>
+      row.reduce((s, w, j) => s + w * hT[j], 0) + this.by[i]
+    );
+    const probs = softmax(logits);
+
+    return { probs, hiddenStates, rawH };
+  }
+
+  /** Public forward — returns softmax probabilities only */
+  forward(sequence: number[][]): number[] {
+    return this.forwardFull(sequence).probs;
+  }
+
+  // ── Truncated BPTT ───────────────────────────────────────────────────────
+
+  /**
+   * One training step over a full sequence.
+   * label: 0=BUY, 1=SELL, 2=HOLD
+   */
+  train(sequence: number[][], label: number): void {
+    const T = sequence.length;
+    const { probs, hiddenStates, rawH } = this.forwardFull(sequence);
+
+    // ── Output gradient (cross-entropy + softmax) ──
+    const dLogits = probs.map((p, i) => p - (i === label ? 1 : 0)); // [OUTPUT]
+
+    // ── Wy, by gradients ──
+    const hT = hiddenStates[T];
+    const dWy: Matrix = this.Wy.map((_, i) => hT.map(hj => dLogits[i] * hj));
+    const dby = [...dLogits];
+
+    // ── Backprop into hT ──
+    const dHNext: number[] = hT.map((_, j) =>
+      this.Wy.reduce((s, row, i) => s + row[j] * dLogits[i], 0)
+    );
+
+    // Accumulate weight gradients over timesteps
+    const dWx: Matrix = zerosMatrix(RNN.HIDDEN_SIZE, RNN.INPUT_SIZE);
+    const dWh: Matrix = zerosMatrix(RNN.HIDDEN_SIZE, RNN.HIDDEN_SIZE);
+    const dbh: number[] = zeros(RNN.HIDDEN_SIZE);
+
+    let dH = dHNext;
+
+    for (let t = T - 1; t >= 0; t--) {
+      // dH through tanh
+      const dZ = dH.map((d, i) => d * tanhDeriv(hiddenStates[t + 1][i]));
+
+      // Accumulate Wx gradients
+      dZ.forEach((dz, i) => {
+        sequence[t].forEach((xj, j) => { dWx[i][j] += dz * xj; });
+        hiddenStates[t].forEach((hj, j) => { dWh[i][j] += dz * hj; });
+        dbh[i] += dz;
+      });
+
+      // Propagate gradient to previous hidden state
+      dH = hiddenStates[t].map((_, j) =>
+        this.Wh.reduce((s, row, i) => s + row[j] * dZ[i], 0)
+      );
+    }
+
+    // ── Adam update ──
+    this.t++;
+    if (!this.mWx) this._initMoments();
+    this._adamMatrix(this.Wx, dWx, this.mWx!, this.vWx!);
+    this._adamMatrix(this.Wh, dWh, this.mWh!, this.vWh!);
+    this._adamMatrix(this.Wy, dWy, this.mWy!, this.vWy!);
+    this._adamBias(this.bh, dbh, this.mbh!, this.vbh!);
+    this._adamBias(this.by, dby, this.mby!, this.vby!);
+  }
+
+  // ── Adam helpers ─────────────────────────────────────────────────────────
+
+  private _initMoments(): void {
+    const mxLike = (m: Matrix): Matrix => m.map(r => r.map(() => 0));
+    this.mWx = mxLike(this.Wx); this.vWx = mxLike(this.Wx);
+    this.mWh = mxLike(this.Wh); this.vWh = mxLike(this.Wh);
+    this.mWy = mxLike(this.Wy); this.vWy = mxLike(this.Wy);
+    this.mbh = zeros(RNN.HIDDEN_SIZE); this.vbh = zeros(RNN.HIDDEN_SIZE);
+    this.mby = zeros(RNN.OUTPUT_SIZE); this.vby = zeros(RNN.OUTPUT_SIZE);
+  }
+
+  private _adamMatrix(W: Matrix, dW: Matrix, mW: Matrix, vW: Matrix): void {
+    const bc1 = 1 - Math.pow(this.beta1, this.t);
+    const bc2 = 1 - Math.pow(this.beta2, this.t);
+    W.forEach((row, i) => {
+      row.forEach((_, j) => {
+        mW[i][j] = this.beta1 * mW[i][j] + (1 - this.beta1) * dW[i][j];
+        vW[i][j] = this.beta2 * vW[i][j] + (1 - this.beta2) * dW[i][j] ** 2;
+        W[i][j] -= this.lr * (mW[i][j] / bc1) / (Math.sqrt(vW[i][j] / bc2) + this.eps);
+      });
+    });
+  }
+
+  private _adamBias(b: number[], db: number[], mb: number[], vb: number[]): void {
+    const bc1 = 1 - Math.pow(this.beta1, this.t);
+    const bc2 = 1 - Math.pow(this.beta2, this.t);
+    b.forEach((_, i) => {
+      mb[i] = this.beta1 * mb[i] + (1 - this.beta1) * db[i];
+      vb[i] = this.beta2 * vb[i] + (1 - this.beta2) * db[i] ** 2;
+      b[i] -= this.lr * (mb[i] / bc1) / (Math.sqrt(vb[i] / bc2) + this.eps);
+    });
+  }
+
+  setLearningRate(lr: number): void { this.lr = lr; }
+}
+
 // ─── TradingBot ───────────────────────────────────────────────────────────────
 
 class TradingBot {
@@ -244,14 +431,19 @@ class TradingBot {
 
   // ANN model — persists across calls (online learning)
   private ann: ANN;
+
+  // RNN model — persists across calls (online learning)
+  private rnn: RNN;
+
   private learningRate: number = 0.001;
 
   private constructor() {
     this.ann = new ANN(this.learningRate);
-    console.log("Trading bot initialised with ANN model");
+    this.rnn = new RNN(this.learningRate);
+    console.log("Trading bot initialised with ANN + RNN models");
     this.initializeHistoricalData();
-    // Pre-train on synthetic data so the model isn't cold on first request
     this.preTrainANN();
+    this.preTrainRNN();
   }
 
   public static getInstance(): TradingBot {
@@ -279,8 +471,9 @@ class TradingBot {
     if (learningRate !== undefined) {
       this.learningRate = Math.max(0.0001, Math.min(0.05, learningRate));
       this.ann.setLearningRate(this.learningRate);
+      this.rnn.setLearningRate(this.learningRate);
     }
-    console.log(`ANN learning rate set to ${this.learningRate}`);
+    console.log(`ANN + RNN learning rate set to ${this.learningRate}`);
   }
 
   public async getPerformanceMetrics(): Promise<BotPerformanceMetrics> {
@@ -318,6 +511,7 @@ class TradingBot {
       case "RSI":            return this.rsiStrategy(stock, priceHistory);
       case "MACD":           return this.macdStrategy(stock, priceHistory);
       case "BOLLINGER":      return this.bollingerBandsStrategy(stock, priceHistory);
+      case "RNN":            return this.rnnStrategy(stock, priceHistory);
       case "ANN":
       default:               return this.annStrategy(stock, priceHistory);
     }
@@ -343,7 +537,7 @@ class TradingBot {
         profitLoss: action === "SELL" ? quantity * stock.currentPrice * 0.03 : null
       });
 
-      // Online fine-tune: reward the action the user confirmed
+      // Online fine-tune both models with the confirmed action
       this.onlineTrain(stockId, action);
       console.log(`Executed ${action} x${quantity} of ${stock.symbol}`);
       return true;
@@ -360,8 +554,6 @@ class TradingBot {
   // ── ANN Strategy ──────────────────────────────────────────────────────────
 
   /**
-   * Build a 7-feature input vector, run the ANN, and return a TradingDecision.
-   *
    * Features (all normalised to [0,1]):
    *   0. RSI(14)           — momentum
    *   1. SMA10 / SMA50     — trend direction
@@ -382,20 +574,19 @@ class TradingBot {
     }
 
     const input = this.buildFeatureVector(priceHistory);
-    const probs = this.ann.forward(input); // [P(BUY), P(SELL), P(HOLD)]
+    const probs = this.ann.forward(input);
 
     const labels: TradingSignal[] = ["BUY", "SELL", "HOLD"];
     const best  = probs.indexOf(Math.max(...probs));
     const signal: TradingSignal = labels[best];
     const confidence = Math.round(Math.min(97, probs[best] * 100 + 10));
 
-    // Human-readable feature insights
     const closePrices = priceHistory.map(d => d.close);
-    const rsi  = this.calculateRSI(closePrices, 14);
+    const rsi   = this.calculateRSI(closePrices, 14);
     const sma10 = this.calculateSMA(closePrices, 10);
     const sma50 = this.calculateSMA(closePrices, 50);
 
-    const rsiLabel  = rsi < 35 ? "oversold" : rsi > 65 ? "overbought" : "neutral";
+    const rsiLabel   = rsi < 35 ? "oversold" : rsi > 65 ? "overbought" : "neutral";
     const trendLabel = sma10 > sma50 ? "bullish" : "bearish";
 
     return {
@@ -408,40 +599,115 @@ class TradingBot {
     };
   }
 
+  // ── RNN Strategy ──────────────────────────────────────────────────────────
+
+  /**
+   * Uses the same 7-feature vector as the ANN, but feeds a sliding window of
+   * the last SEQ_LEN=10 daily snapshots into the RNN.  The recurrent hidden
+   * state lets the model capture short-term temporal patterns (e.g. a trend
+   * that has been building over several days) that a single-step ANN cannot.
+   *
+   * Sequence composition (oldest → newest):
+   *   [t-9, t-8, …, t-1, t]  →  h_t  →  softmax([BUY, SELL, HOLD])
+   *
+   * Confidence is boosted by agreement with the single-step ANN prediction,
+   * rewarding cases where both models reach the same conclusion.
+   */
+  private rnnStrategy(stock: Stock, priceHistory: StockPriceHistory[]): TradingDecision {
+    const seqLen = RNN.SEQ_LEN;
+    const minLen = 50 + seqLen; // need enough history for feature calc at each step
+
+    if (priceHistory.length < minLen) {
+      return {
+        signal: "HOLD",
+        confidence: 50,
+        reason: "Insufficient historical data for RNN strategy",
+        indicatorsUsed: ["RNN"]
+      };
+    }
+
+    // Build a sequence of feature vectors, one per timestep in the window.
+    // For timestep t we use priceHistory[0..t] so each vector sees only data
+    // available up to that day (no look-ahead bias).
+    const totalLen = priceHistory.length;
+    const sequence: number[][] = [];
+
+    for (let step = 0; step < seqLen; step++) {
+      // Slice history up to this timestep (inclusive)
+      const sliceEnd = totalLen - (seqLen - 1 - step);
+      const histSlice = priceHistory.slice(0, sliceEnd);
+      sequence.push(this.buildFeatureVector(histSlice));
+    }
+
+    // Run RNN forward pass over the sequence
+    const probs = this.rnn.forward(sequence);
+    const labels: TradingSignal[] = ["BUY", "SELL", "HOLD"];
+    const best   = probs.indexOf(Math.max(...probs));
+    const signal: TradingSignal = labels[best];
+
+    // Optional: cross-check with single-step ANN to calibrate confidence
+    const annInput  = this.buildFeatureVector(priceHistory);
+    const annProbs  = this.ann.forward(annInput);
+    const annBest   = annProbs.indexOf(Math.max(...annProbs));
+    const agreement = annBest === best;
+
+    // Confidence: base from RNN output, +5 bonus if ANN agrees
+    const baseConf   = Math.round(Math.min(95, probs[best] * 100 + 10));
+    const confidence = agreement ? Math.min(97, baseConf + 5) : baseConf;
+
+    // Human-readable momentum summary from the last few steps
+    const recent   = sequence.slice(-3).map(v => v[5]); // feature 5 = 5-day return
+    const momentum = recent.every(r => r > 0.5) ? "sustained upward momentum"
+                   : recent.every(r => r < 0.5) ? "sustained downward momentum"
+                   : "mixed momentum";
+
+    const closePrices = priceHistory.map(d => d.close);
+    const rsi   = this.calculateRSI(closePrices, 14);
+    const rsiLabel = rsi < 35 ? "oversold" : rsi > 65 ? "overbought" : "neutral";
+
+    return {
+      signal,
+      confidence,
+      reason:
+        `RNN model (${seqLen}-day sequence): ${momentum}, RSI ${rsiLabel} (${rsi.toFixed(1)}). ` +
+        `Sequence confidence: BUY ${(probs[0]*100).toFixed(1)}% / ` +
+        `SELL ${(probs[1]*100).toFixed(1)}% / HOLD ${(probs[2]*100).toFixed(1)}%. ` +
+        `ANN cross-check: ${agreement ? "agrees" : "disagrees"}.`,
+      indicatorsUsed: [
+        "RNN", "RSI", "SMA", "Bollinger Bands", "MACD", "Volatility", "Volume", "Sequence"
+      ]
+    };
+  }
+
+  // ── Shared feature builder ────────────────────────────────────────────────
+
   /** Build normalised [0,1] feature vector of length 7 */
   private buildFeatureVector(priceHistory: StockPriceHistory[]): number[] {
     const closePrices = priceHistory.map(d => d.close);
     const volumes     = priceHistory.map(d => d.volume);
 
-    // 1. RSI → [0,1]
-    const rsi = this.calculateRSI(closePrices, 14);
+    const rsi  = this.calculateRSI(closePrices, 14);
     const f0   = normalise(rsi, 0, 100);
 
-    // 2. SMA10 / SMA50 ratio → [0,1]  (0.5 = neutral, >0.5 = bullish)
     const sma10 = this.calculateSMA(closePrices, 10);
     const sma50 = this.calculateSMA(closePrices, 50);
     const f1    = normalise(sma10 / sma50, 0.85, 1.15);
 
-    // 3. %B Bollinger Bands → already ~[0,1]
     const { upper, lower } = this.calculateBollingerBands(closePrices, 20, 2);
     const curP = closePrices[closePrices.length - 1];
     const f2   = normalise(curP, lower, upper);
 
-    // 4. MACD histogram → normalised
     const { histogram } = this.calculateMACD(closePrices);
     const f3 = normalise(histogram, -curP * 0.02, curP * 0.02);
 
-    // 5. Volatility(14) → [0,1]
     const vol = this.calculateVolatility(closePrices, 14);
     const f4  = normalise(vol, 0, 0.06);
 
-    // 6. 5-day return → [0,1]
     const ret5 = closePrices.length >= 6
       ? (closePrices[closePrices.length - 1] / closePrices[closePrices.length - 6]) - 1
       : 0;
     const f5 = normalise(ret5, -0.05, 0.05);
 
-    // 7. Volume ratio (last / avg-20) → [0,1]
     const lastVol = volumes[volumes.length - 1];
     const avgVol  = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
     const f6      = normalise(lastVol / (avgVol || 1), 0, 3);
@@ -449,28 +715,45 @@ class TradingBot {
     return [f0, f1, f2, f3, f4, f5, f6];
   }
 
-  /** Online training after a confirmed trade */
-  private onlineTrain(stockId: number, action: TradingSignal): void {
-    const hist = this.getHistoricalPriceData(stockId);
-    if (hist.length < 50) return;
+  // ── Online learning ───────────────────────────────────────────────────────
 
-    const input = this.buildFeatureVector(hist);
+  /** Fine-tune both ANN and RNN after a confirmed trade */
+  private onlineTrain(stockId: number, action: TradingSignal): void {
+    const hist  = this.getHistoricalPriceData(stockId);
     const label = action === "BUY" ? 0 : action === "SELL" ? 1 : 2;
-    this.ann.train(input, label);
+
+    // ANN: single feature vector
+    if (hist.length >= 50) {
+      const input = this.buildFeatureVector(hist);
+      this.ann.train(input, label);
+    }
+
+    // RNN: sequence of feature vectors
+    const seqLen = RNN.SEQ_LEN;
+    const minLen = 50 + seqLen;
+    if (hist.length >= minLen) {
+      const totalLen = hist.length;
+      const sequence: number[][] = [];
+      for (let step = 0; step < seqLen; step++) {
+        const sliceEnd = totalLen - (seqLen - 1 - step);
+        sequence.push(this.buildFeatureVector(hist.slice(0, sliceEnd)));
+      }
+      this.rnn.train(sequence, label);
+    }
   }
+
+  // ── Pre-training ──────────────────────────────────────────────────────────
 
   /**
    * Pre-train the ANN on synthetic labeled examples so it starts with
    * sensible weights rather than random Xavier init.
    */
   private preTrainANN(): void {
-    // Rules: RSI<35 → BUY(0), RSI>65 → SELL(1), else → HOLD(2)
     for (let i = 0; i < 500; i++) {
-      const rsi01 = Math.random();         // 0=RSI 0, 1=RSI 100
+      const rsi01 = Math.random();
       const rsi   = rsi01 * 100;
       const label = rsi < 35 ? 0 : rsi > 65 ? 1 : 2;
 
-      // Construct a plausible feature vector consistent with the RSI
       const trend  = rsi < 50 ? 0.4 + Math.random() * 0.1 : 0.55 + Math.random() * 0.1;
       const pctB   = rsi < 35 ? Math.random() * 0.2 : rsi > 65 ? 0.8 + Math.random() * 0.2 : 0.3 + Math.random() * 0.4;
       const macd01 = rsi < 50 ? 0.3 + Math.random() * 0.2 : 0.55 + Math.random() * 0.2;
@@ -481,6 +764,59 @@ class TradingBot {
       this.ann.train([rsi01, trend, pctB, macd01, vol01, ret01, volR], label);
     }
     console.log("ANN pre-training complete (500 synthetic epochs)");
+  }
+
+  /**
+   * Pre-train the RNN on synthetic sequences.
+   *
+   * Each sequence is a smooth 10-step trajectory ending at a given RSI level,
+   * so the RNN learns to decode trending feature patterns, not just snapshots.
+   * Label rule: final RSI < 35 → BUY(0), > 65 → SELL(1), else → HOLD(2).
+   */
+  private preTrainRNN(): void {
+    const seqLen = RNN.SEQ_LEN;
+
+    for (let i = 0; i < 500; i++) {
+      const finalRsi = Math.random() * 100;
+      const label    = finalRsi < 35 ? 0 : finalRsi > 65 ? 1 : 2;
+
+      // Build a smooth sequence: linearly interpolate from a neutral start
+      const startRsi = 45 + (Math.random() * 10 - 5); // start near neutral
+      const sequence: number[][] = [];
+
+      for (let t = 0; t < seqLen; t++) {
+        const alpha = t / (seqLen - 1);
+        const rsi   = startRsi + alpha * (finalRsi - startRsi);
+        const rsi01 = normalise(rsi, 0, 100);
+
+        // Correlated features: trend follows RSI direction, noise added
+        const trend  = rsi < 50
+          ? 0.4 + alpha * 0.1 + (Math.random() - 0.5) * 0.05
+          : 0.55 + alpha * 0.1 + (Math.random() - 0.5) * 0.05;
+        const pctB   = rsi01 + (Math.random() - 0.5) * 0.1;
+        const macd01 = rsi < 50
+          ? 0.35 + alpha * 0.15 + (Math.random() - 0.5) * 0.05
+          : 0.55 + alpha * 0.1  + (Math.random() - 0.5) * 0.05;
+        const vol01  = 0.2 + Math.random() * 0.6;
+        const ret01  = rsi < 50
+          ? 0.35 + alpha * 0.1 + (Math.random() - 0.5) * 0.05
+          : 0.55 + alpha * 0.1 + (Math.random() - 0.5) * 0.05;
+        const volR   = 0.2 + Math.random() * 0.6;
+
+        sequence.push([
+          Math.min(1, Math.max(0, rsi01)),
+          Math.min(1, Math.max(0, trend)),
+          Math.min(1, Math.max(0, pctB)),
+          Math.min(1, Math.max(0, macd01)),
+          Math.min(1, Math.max(0, vol01)),
+          Math.min(1, Math.max(0, ret01)),
+          Math.min(1, Math.max(0, volR))
+        ]);
+      }
+
+      this.rnn.train(sequence, label);
+    }
+    console.log("RNN pre-training complete (500 synthetic sequence epochs)");
   }
 
   // ── Technical strategies (unchanged from original) ────────────────────────

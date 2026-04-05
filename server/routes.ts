@@ -90,12 +90,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     catch { res.status(500).json({ message: "Failed to generate decision" }); }
   });
 
-  // ── Strategy endpoint — ANN replaces REINFORCEMENT_LEARNING ──
+  // ── Strategy endpoint — "RNN" added alongside ANN ──
   app.post("/api/trading-bot/strategy", authenticate, async (req, res) => {
     try {
       const { strategy } = req.body;
-      // NOTE: "ANN" replaces the old "REINFORCEMENT_LEARNING" value
-      if (!["MOVING_AVERAGE", "RSI", "MACD", "BOLLINGER", "ANN"].includes(strategy)) {
+      if (!["MOVING_AVERAGE", "RSI", "MACD", "BOLLINGER", "ANN", "RNN"].includes(strategy)) {
         return res.status(400).json({ message: "Invalid strategy" });
       }
       tradingBot.setStrategy(strategy as TradingStrategy);
